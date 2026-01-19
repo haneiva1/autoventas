@@ -4,6 +4,24 @@ import { config } from '../lib/config.js';
 import { processWebhookEvent } from '../services/webhook-processor.js';
 
 export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
+  // WhatsApp Cloud API verification endpoint (GET)
+  // Meta sends hub.mode, hub.verify_token, hub.challenge as query params
+  fastify.get('/whatsapp/verify', async (request, reply) => {
+    const query = request.query as Record<string, string>;
+
+    const mode = query['hub.mode'];
+    const token = query['hub.verify_token'];
+    const challenge = query['hub.challenge'];
+
+    if (mode === 'subscribe' && token === 'ruah_verify_token_2026') {
+      request.log.info('WhatsApp webhook verified successfully');
+      return reply.type('text/plain').send(challenge);
+    }
+
+    request.log.warn({ mode, tokenProvided: !!token }, 'WhatsApp webhook verification failed');
+    return reply.status(403).type('text/plain').send('Forbidden');
+  });
+
   // Webhook verification (GET) - WhatsApp sends this to verify endpoint
   fastify.get('/whatsapp', async (request, reply) => {
     const query = request.query as Record<string, string>;
