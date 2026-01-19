@@ -334,8 +334,8 @@ async function processMessage(
 // ============================================================================
 
 export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
-  // GET /webhooks/whatsapp - Meta verification
-  fastify.get('/whatsapp', async (request, reply) => {
+  // GET /webhooks/whatsapp/verify - Meta verification
+  fastify.get('/whatsapp/verify', async (request, reply) => {
     const query = request.query as Record<string, string>;
 
     const mode = query['hub.mode'];
@@ -344,17 +344,10 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
 
     const verifyToken = config.WHATSAPP_VERIFY_TOKEN;
 
-    if (!verifyToken) {
-      request.log.error('WHATSAPP_VERIFY_TOKEN not configured');
-      return reply.status(500).type('text/plain').send('Server misconfigured');
-    }
-
     if (mode === 'subscribe' && token === verifyToken) {
-      request.log.info('WhatsApp webhook verified successfully');
       return reply.status(200).type('text/plain').send(challenge);
     }
 
-    request.log.warn({ mode, tokenMatch: token === verifyToken }, 'Webhook verification failed');
     return reply.status(403).type('text/plain').send('Forbidden');
   });
 
