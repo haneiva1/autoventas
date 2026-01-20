@@ -1,92 +1,286 @@
-import type { FastifyInstance } from "fastify";
-import { generateReply } from "../services/llm";
+import { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
+import { randomUUID } from 'crypto';
+import { config } from '../lib/config.js';
+import { supabaseAdmin } from '../lib/supabase.js';
+import { sendWhatsAppText } from '../lib/whatsapp.js';
+import { generateReply } from '../services/llm.js';
+import { processWithRules, getContext } from '../helpers/index.js';
 
-type AnyObj = Record<string, any>;
+// ============================================================================
+// WhatsApp Webhook Schema
+// ============================================================================
 
-function getTextFromWebhook(body: AnyObj): { from?: string; text?: string } {
-  const msg =
-    body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0] ??
-    body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+const TextMessageSchema = z.object({
+  body: z.string(),
+});
 
-  const from = msg?.from as string | undefined;
+const MessageSchema = z.object({
+  from: z.string(),
+  id: z.string(),
+  timestamp: z.string(),
+  type: z.string(),
+  text: TextMessageSchema.optional(),
+});
 
-  const text =
-    msg?.text?.body ??
-    msg?.button?.text ??
-    msg?.interactive?.button_reply?.title ??
-    msg?.interactive?.list_reply?.title ??
-    msg?.interactive?.list_reply?.description;
+const ContactSchema = z.object({
+  profile: z.object({
+    name: z.string(),
+  }),
+  wa_id: z.string(),
+});
 
-  return { from, text };
+const MetadataSchema = z.object({
+  display_phone_number: z.string(),
+  phone_number_id: z.string(),
+});
+
+const ValueSchema = z.object({
+  messaging_product: z.literal('whatsapp'),
+  metadata: MetadataSchema,
+  contacts: z.array(ContactSchema).optional(),
+  messages: z.array(MessageSchema).optional(),
+  statuses: z.array(z.any()).optional(),
+});
+
+const ChangeSchema = z.object({
+  value: ValueSchema,
+  field: z.literal('messages'),
+});
+
+const EntrySchema = z.object({
+  id: z.string(),
+  changes: z.array(ChangeSchema),
+});
+
+const WhatsAppWebhookSchema = z.object({
+  object: z.literal('whatsapp_business_account'),
+  entry: z.array(EntrySchema),
+});
+
+// ============================================================================
+// Database Persistence
+// ============================================================================
+
+interface PersistMessageParams {
+  direction: 'inbound' | 'outbound';
+  phone: string;
+  name?: string | null;
+  text: string;
+  raw?: unknown;
+  waMessageId?: string;
+  requestId: string;
 }
 
-async function sendWhatsAppText(to: string, text: string) {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+async function persistMessage(params: PersistMessageParams, log: any): Promise<string | null> {
+  const { direction, phone, name, text, raw, waMessageId, requestId } = params;
 
-  if (!token || !phoneNumberId) {
-    throw new Error(
-      "Missing env vars: WHATSAPP_ACCESS_TOKEN and/or WHATSAPP_PHONE_NUMBER_ID (revisa apps/api/.env)"
-    );
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('messages')
+      .insert({
+        direction,
+        wa_phone: phone,
+        sender_name: name || null,
+        body: text,
+        raw_payload: raw ? JSON.stringify(raw) : null,
+        wa_message_id: waMessageId || null,
+        tenant_id: config.TENANT_ID,
+      })
+      .select('id')
+      .single();
+
+    if (error) {
+      log.error({ error: error.message, code: error.code, requestId }, '[DB] Failed to persist message');
+      return null;
+    }
+
+    log.info({ messageDbId: data.id, direction, phone: phone.slice(-4), requestId }, '[DB] Message persisted');
+    return data.id;
+  } catch (err) {
+    log.error({ error: err, requestId }, '[DB] Exception persisting message');
+    return null;
   }
+}
 
-  const url = `https://graph.facebook.com/v21.0/${phoneNumberId}/messages`;
+// ============================================================================
+// WhatsApp Cloud API - Send Message (wrapper with persistence)
+// ============================================================================
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
+async function sendWhatsAppMessage(
+  to: string,
+  text: string,
+  log: any,
+  requestId?: string
+): Promise<boolean> {
+  const rid = requestId || randomUUID();
+
+  // Send via WhatsApp
+  const result = await sendWhatsAppText(to, text, rid);
+
+  // Persist outbound message
+  persistMessage({
+    direction: 'outbound',
+    phone: to,
+    text,
+    waMessageId: result.messageId,
+    requestId: rid,
+  }, log).catch(err => log.error({ error: err, requestId: rid }, '[DB] Failed to persist outbound'));
+
+  return result.success;
+}
+
+// ============================================================================
+// Message Processing with Rules + LLM Fallback
+// ============================================================================
+
+async function processMessage(
+  phone: string,
+  messageText: string,
+  contactName: string | null,
+  log: any,
+  requestId: string
+): Promise<void> {
+  // Log context state before processing
+  const contextBefore = getContext(phone);
+  log.info(
+    {
+      phone: phone.slice(-4),
+      textPreview: messageText.slice(0, 50),
+      state: contextBefore.state,
+      flavor: contextBefore.flavor,
+      requestId,
     },
-    body: JSON.stringify({
-      messaging_product: "whatsapp",
-      to,
-      type: "text",
-      text: { body: text },
-    }),
-  });
+    '[PROCESS] Processing message'
+  );
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) {
-    throw new Error(`Graph /messages failed (${res.status}): ${JSON.stringify(data)}`);
+  // ========================================
+  // PASO 1: Intentar manejar con reglas
+  // ========================================
+  const ruleResult = processWithRules(phone, messageText, contactName);
+
+  if (ruleResult.handled && ruleResult.reply) {
+    log.info(
+      {
+        phone: phone.slice(-4),
+        newState: ruleResult.newState,
+        requestId,
+      },
+      '[RULES] Message handled by rules'
+    );
+
+    // Enviar respuesta y terminar
+    await sendWhatsAppMessage(phone, ruleResult.reply, log, requestId);
+    return; // <-- IMPORTANTE: corta flujo, no llama al LLM
   }
-  return data;
+
+  // ========================================
+  // PASO 2: Fallback al LLM
+  // ========================================
+  log.info(
+    { phone: phone.slice(-4), requestId },
+    '[PROCESS] Rules did not handle, using LLM'
+  );
+
+  const reply = await generateReply(
+    { text: messageText, waPhone: phone, contactName },
+    requestId
+  );
+
+  await sendWhatsAppMessage(phone, reply, log, requestId);
 }
 
-// server.ts normalmente registra este archivo con prefix "/webhooks"
-// => estas rutas quedan como:
-// GET/POST https://api.chocolatesruah.com/webhooks/whatsapp
-export async function webhookRoutes(fastify: FastifyInstance) {
-  // === Meta webhook verification (GET) ===
-  fastify.get("/whatsapp", async (request, reply) => {
-    const q: AnyObj = (request as any).query ?? {};
-    const mode = q["hub.mode"];
-    const token = q["hub.verify_token"];
-    const challenge = q["hub.challenge"];
+// ============================================================================
+// Fastify Routes
+// ============================================================================
 
-    if (mode === "subscribe" && token === process.env.WHATSAPP_VERIFY_TOKEN) {
-      return reply.code(200).type("text/plain").send(String(challenge ?? ""));
-    }
-    return reply.code(403).type("text/plain").send("Forbidden");
-  });
+export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
+  // GET /webhooks/whatsapp - Meta verification
+  fastify.get('/whatsapp', async (request, reply) => {
+    const query = request.query as Record<string, string>;
 
-  // === Inbound messages (POST) ===
-  fastify.post("/whatsapp", async (request, reply) => {
-    const body: AnyObj = (request as any).body ?? {};
-    const { from, text } = getTextFromWebhook(body);
+    const mode = query['hub.mode'];
+    const token = query['hub.verify_token'];
+    const challenge = query['hub.challenge'];
 
-    fastify.log.info({ from, text }, "WA inbound");
+    const verifyToken = config.WHATSAPP_VERIFY_TOKEN;
 
-    // Siempre 200 para que Meta no reintente
-    if (!from) return reply.code(200).send({ received: true });
-
-    try {
-      const aiReply = await generateReply(text ?? "");
-    await sendWhatsAppText(from, aiReply);
-    } catch (err: any) {
-      fastify.log.error({ err: String(err?.message ?? err) }, "WA reply failed");
+    if (mode === 'subscribe' && token === verifyToken) {
+      return reply.status(200).type('text/plain').send(challenge);
     }
 
-    return reply.code(200).send({ received: true });
+    return reply.status(403).type('text/plain').send('Forbidden');
   });
-}
+
+  // POST /webhooks/whatsapp - Incoming events
+  fastify.post('/whatsapp', async (request, reply) => {
+    const startTime = Date.now();
+    const requestId = randomUUID();
+
+    const parseResult = WhatsAppWebhookSchema.safeParse(request.body);
+    if (!parseResult.success) {
+      request.log.warn({ errors: parseResult.error.issues, requestId }, '[WEBHOOK] Invalid payload');
+      return reply.status(400).send({ error: 'Invalid payload' });
+    }
+
+    const payload = parseResult.data;
+
+    // Process messages
+    for (const entry of payload.entry) {
+      for (const change of entry.changes) {
+        const value = change.value;
+
+        // Skip if no messages (could be status update)
+        if (!value.messages || value.messages.length === 0) {
+          request.log.debug({ requestId }, '[WEBHOOK] No messages in event, skipping');
+          continue;
+        }
+
+        for (const message of value.messages) {
+          // Only process text messages
+          if (message.type !== 'text' || !message.text?.body) {
+            request.log.debug({ type: message.type, requestId }, '[WEBHOOK] Skipping non-text message');
+            continue;
+          }
+
+          const phone = message.from;
+          const text = message.text.body;
+          const waMessageId = message.id;
+          const contactName = value.contacts?.[0]?.profile?.name || null;
+
+          request.log.info(
+            { requestId, wa_id: phone.slice(-4), textPreview: text.slice(0, 50), waMessageId },
+            '[WEBHOOK] Inbound message received'
+          );
+
+          // Persist inbound message
+          persistMessage({
+            direction: 'inbound',
+            phone,
+            name: contactName,
+            text,
+            raw: request.body,
+            waMessageId,
+            requestId,
+          }, request.log).catch(err =>
+            request.log.error({ error: err, requestId }, '[DB] Failed to persist inbound')
+          );
+
+          // Process asynchronously to not block webhook response
+          setImmediate(async () => {
+            try {
+              await processMessage(phone, text, contactName, request.log, requestId);
+            } catch (error) {
+              request.log.error({ error, phone: phone.slice(-4), requestId }, '[PROCESS] Failed to process message');
+            }
+          });
+        }
+      }
+    }
+
+    const duration = Date.now() - startTime;
+    request.log.info({ duration, requestId }, '[WEBHOOK] Response sent');
+
+    return reply.status(200).send({ received: true });
+  });
+};

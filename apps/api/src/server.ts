@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import rateLimit from '@fastify/rate-limit';
@@ -29,6 +30,14 @@ async function buildApp() {
     return { status: 'ok', timestamp: new Date().toISOString() };
   });
 
+  // Privacy policy (required by Meta for WhatsApp Business)
+  app.get('/privacy', async (request, reply) => {
+    return reply.type('text/html').send(`<!DOCTYPE html>
+<html><head><title>Privacy Policy</title></head>
+<body><h1>Privacy Policy</h1><p>Your privacy is important to us.</p></body>
+</html>`);
+  });
+
   // Register routes
   await app.register(webhookRoutes, { prefix: '/webhooks' });
   await app.register(paymentsRoutes, { prefix: '/api/payments' });
@@ -44,8 +53,14 @@ async function start() {
   try {
     await app.listen({ port: config.API_PORT, host: '0.0.0.0' });
     logger.info(`Server listening on port ${config.API_PORT}`);
-  } catch (err) {
-    logger.error(err);
+  } catch (err: any) {
+    if (err.code === 'EADDRINUSE') {
+      logger.error(`Port ${config.API_PORT} is already in use.`);
+      logger.error(`Run: lsof -i :${config.API_PORT} | grep LISTEN`);
+      logger.error(`Kill: kill -9 <PID>`);
+    } else {
+      logger.error(err);
+    }
     process.exit(1);
   }
 }

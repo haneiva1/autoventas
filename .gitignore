@@ -32,3 +32,14 @@ coverage/
 
 # Supabase
 .supabase/
+
+# Local / secrets
+meta_token.txt
+payload.json
+resp.json
+
+# Supabase temp
+supabase/temp/
+
+# Build artifacts
+*.tsbuildinfo
