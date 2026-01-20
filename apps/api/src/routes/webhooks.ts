@@ -3,7 +3,6 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { config } from '../lib/config.js';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { sendWhatsAppText } from '../lib/whatsapp.js';
 import { generateReply } from '../services/llm.js';
 import { processWithRules, getContext } from '../helpers/index.js';
 
@@ -104,30 +103,39 @@ async function persistMessage(params: PersistMessageParams, log: any): Promise<s
 }
 
 // ============================================================================
-// WhatsApp Cloud API - Send Message (wrapper with persistence)
+// WhatsApp Cloud API - Send Message
 // ============================================================================
 
-async function sendWhatsAppMessage(
-  to: string,
-  text: string,
-  log: any,
-  requestId?: string
-): Promise<boolean> {
-  const rid = requestId || randomUUID();
+async function sendWhatsAppMessage(to: string, text: string): Promise<void> {
+  const phoneNumberId = config.WHATSAPP_PHONE_NUMBER_ID;
+  const accessToken = config.WHATSAPP_ACCESS_TOKEN;
 
-  // Send via WhatsApp
-  const result = await sendWhatsAppText(to, text, rid);
+  if (!phoneNumberId || !accessToken) {
+    console.log('[WA] Skipping send (no credentials):', { to: to.slice(-4), text: text.slice(0, 50) });
+    return;
+  }
 
-  // Persist outbound message
-  persistMessage({
-    direction: 'outbound',
-    phone: to,
-    text,
-    waMessageId: result.messageId,
-    requestId: rid,
-  }, log).catch(err => log.error({ error: err, requestId: rid }, '[DB] Failed to persist outbound'));
+  const url = `https://graph.facebook.com/v18.0/${phoneNumberId}/messages`;
 
-  return result.success;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messaging_product: 'whatsapp',
+      recipient_type: 'individual',
+      to,
+      type: 'text',
+      text: { body: text },
+    }),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error('[WA] Send failed:', response.status, errorText);
+  }
 }
 
 // ============================================================================
@@ -170,7 +178,7 @@ async function processMessage(
     );
 
     // Enviar respuesta y terminar
-    await sendWhatsAppMessage(phone, ruleResult.reply, log, requestId);
+    await sendWhatsAppMessage(phone, ruleResult.reply);
     return; // <-- IMPORTANTE: corta flujo, no llama al LLM
   }
 
@@ -182,12 +190,9 @@ async function processMessage(
     '[PROCESS] Rules did not handle, using LLM'
   );
 
-  const reply = await generateReply(
-    { text: messageText, waPhone: phone, contactName },
-    requestId
-  );
+  const reply = await generateReply(messageText);
 
-  await sendWhatsAppMessage(phone, reply, log, requestId);
+  await sendWhatsAppMessage(phone, reply);
 }
 
 // ============================================================================

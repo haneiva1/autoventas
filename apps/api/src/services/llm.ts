@@ -1,4 +1,3 @@
-import fetch from "node-fetch";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
@@ -24,8 +23,8 @@ export async function generateReply(input: string): Promise<string> {
 
   const data = await res.json();
 
-  return (
-    data?.candidates?.[0]?.content?.parts?.[0]?.text ??
-    "No pude responder en este momento."
-  );
+return (
+  (data as any)?.candidates?.[0]?.content?.parts?.[0]?.text ??
+  "No pude responder en este momento."
+);
 }
