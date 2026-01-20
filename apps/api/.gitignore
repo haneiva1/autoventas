@@ -1,0 +1,6 @@
+
+# local backups
+src/**/*.bak*
+package.json.bak*
+src/server.ts.bak*
+scripts/
