@@ -11,9 +11,12 @@
  * 4. Run LLM orchestrator
  * 5. Validate actions
  * 6. Execute actions
- * 7. Build response
+ * 7. Persist state changes to Supabase
+ * 8. Insert action_history records
+ * 9. Build response
  *
- * No side effects: no DB writes, no WhatsApp sends, no logging.
+ * Side effects: Persists state and action history to Supabase.
+ * No WhatsApp sends, no logging.
  */
 
 import type {
@@ -22,7 +25,13 @@ import type {
   FsmState,
   LlmContextInput,
 } from './types';
-import { loadFullState, loadRecentHistory } from './state-loader';
+import {
+  loadFullState,
+  loadRecentHistory,
+  saveConversationState,
+  insertActionHistoryBatch,
+} from './state-loader';
+import type { ActionHistoryRecord } from './state-loader';
 import { detectEvents } from './event-detector';
 import { runLlmOrchestrator } from './llm-orchestrator';
 import { getValidActions } from './action-validator';
@@ -72,7 +81,12 @@ export {
   setHumanOverride,
   updateFsmState,
   updateCart,
+  insertActionHistory,
+  insertActionHistoryBatch,
 } from './state-loader';
+
+// Re-export state loader types
+export type { ActionHistoryRecord } from './state-loader';
 
 // Re-export event detector
 export { detectEvents } from './event-detector';
@@ -100,9 +114,11 @@ export { buildResponse } from './response-builder';
  * 4. Build LLM context and run orchestrator
  * 5. Validate proposed actions
  * 6. Execute valid actions
- * 7. Build and return response
+ * 7. Persist state changes to Supabase (fsm_state, cart, override, llm_response)
+ * 8. Insert action_history records for executed actions
+ * 9. Build and return response
  *
- * No side effects: state changes are returned, not persisted.
+ * Side effects: Persists state and action_history to Supabase.
  *
  * @param input - The incoming message input
  * @returns ProcessMessageResult with response and state changes
@@ -172,8 +188,38 @@ export async function processMessage(
 
   // Determine final state (prefer action execution result, fall back to LLM suggestion)
   const finalState = executionResult.new_state.fsm_state;
+  const previousState = conversationState.fsm_state;
 
-  // Step 8: Build and return response
+  // Step 8: Persist state changes
+  await saveConversationState(
+    { conversation_id, tenant_id },
+    {
+      fsm_state: finalState,
+      cart_json: executionResult.new_state.cart_json,
+      human_override: executionResult.new_state.human_override,
+      human_override_at: executionResult.new_state.human_override_at,
+      last_llm_response: llmResponse,
+    }
+  );
+
+  // Step 9: Insert action history for executed actions
+  const actionHistoryRecords: ActionHistoryRecord[] = executionResult.executed_actions.map(
+    (action) => ({
+      conversation_id,
+      action_type: action.type,
+      action_payload: (action.params || {}) as Record<string, unknown>,
+      validated: true,
+      executed: true,
+      fsm_state_before: previousState,
+      fsm_state_after: finalState,
+    })
+  );
+
+  if (actionHistoryRecords.length > 0) {
+    await insertActionHistoryBatch(actionHistoryRecords);
+  }
+
+  // Step 10: Build and return response
   return buildResponse({
     human_override: executionResult.new_state.human_override,
     response_text: llmResponse.response_text,
