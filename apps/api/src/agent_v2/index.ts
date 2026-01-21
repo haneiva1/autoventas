@@ -3,14 +3,31 @@
  *
  * Exports the processMessage function for handling incoming WhatsApp messages
  * with the new deterministic validation flow.
+ *
+ * Pipeline:
+ * 1. Load state
+ * 2. Detect events
+ * 3. Check human_override
+ * 4. Run LLM orchestrator
+ * 5. Validate actions
+ * 6. Execute actions
+ * 7. Build response
+ *
+ * No side effects: no DB writes, no WhatsApp sends, no logging.
  */
 
 import type {
   ProcessMessageInput,
   ProcessMessageResult,
   FsmState,
+  LlmContextInput,
 } from './types';
-import { loadConversationState } from './state-loader';
+import { loadFullState, loadRecentHistory } from './state-loader';
+import { detectEvents } from './event-detector';
+import { runLlmOrchestrator } from './llm-orchestrator';
+import { getValidActions } from './action-validator';
+import { executeActions } from './action-executor';
+import { buildResponse } from './response-builder';
 
 // Re-export types for consumers
 export type {
@@ -57,93 +74,118 @@ export {
   updateCart,
 } from './state-loader';
 
+// Re-export event detector
+export { detectEvents } from './event-detector';
+
+// Re-export LLM orchestrator
+export { runLlmOrchestrator } from './llm-orchestrator';
+
+// Re-export action executor
+export { executeActions } from './action-executor';
+
+// Re-export response builder
+export { buildResponse } from './response-builder';
+
 // =============================================================================
 // Main Process Message Function
 // =============================================================================
 
 /**
- * Processes an incoming WhatsApp message using Agent V2 logic
+ * Processes an incoming WhatsApp message using Agent V2 logic.
  *
- * Current implementation (skeleton):
- * 1. Loads conversation state (stub)
- * 2. If human_override is true → returns { handled: true, response_text: null } (silence)
- * 3. Otherwise → returns { handled: false } (let V1 handle it)
+ * Pipeline:
+ * 1. Load conversation state and product catalog
+ * 2. Detect events from customer message
+ * 3. If human_override → return silence (handled=true, response_text=null)
+ * 4. Build LLM context and run orchestrator
+ * 5. Validate proposed actions
+ * 6. Execute valid actions
+ * 7. Build and return response
+ *
+ * No side effects: state changes are returned, not persisted.
  *
  * @param input - The incoming message input
- * @returns ProcessMessageResult indicating how the message was handled
+ * @returns ProcessMessageResult with response and state changes
  */
 export async function processMessage(
   input: ProcessMessageInput
 ): Promise<ProcessMessageResult> {
-  const { conversation_id, customer_message, wa_phone, tenant_id } = input;
+  const { conversation_id, customer_message, tenant_id } = input;
 
-  console.log(`[agent_v2] processMessage called:`, {
+  // Step 1: Load conversation state and product catalog
+  const { conversationState, products } = await loadFullState({
     conversation_id,
-    wa_phone,
     tenant_id,
-    message_preview: customer_message.substring(0, 50),
   });
 
-  try {
-    // Step 1: Load conversation state (currently a stub)
-    const state = await loadConversationState({
-      conversation_id,
-      tenant_id,
-    });
+  // Step 2: Detect events from customer message
+  const detectedEvents = detectEvents({
+    customer_message,
+    has_image: false, // TODO: Pass from input when available
+    human_override: conversationState.human_override,
+  });
 
-    console.log(`[agent_v2] Loaded state:`, {
-      fsm_state: state.fsm_state,
-      human_override: state.human_override,
-      cart_items: state.cart_json.items.length,
-    });
-
-    // Step 2: Check human_override - if true, agent stays silent
-    if (state.human_override) {
-      console.log(
-        `[agent_v2] human_override=true, returning silence (handled=true, response_text=null)`
-      );
-      return {
-        handled: true,
-        response_text: null, // null means no response (silence)
-        new_state: state.fsm_state,
-      };
-    }
-
-    // Step 3: For now, return handled=false to let V1 handle it
-    // TODO: Implement full Agent V2 flow:
-    // - Detect events
-    // - Build LLM context
-    // - Call LLM
-    // - Validate proposed actions
-    // - Execute valid actions
-    // - Return response
-    console.log(
-      `[agent_v2] No special handling yet, returning handled=false (V1 will handle)`
-    );
-
-    return {
-      handled: false,
+  // Step 3: If human_override is active, return silence
+  if (conversationState.human_override) {
+    return buildResponse({
+      human_override: true,
       response_text: null,
-    };
-  } catch (error) {
-    console.error(`[agent_v2] Error processing message:`, error);
-
-    // On error, return handled=false so V1 can try
-    return {
-      handled: false,
-      response_text: null,
-      validation_errors: [
-        error instanceof Error ? error.message : 'Unknown error',
-      ],
-    };
+      new_state: conversationState.fsm_state,
+      executed_actions: [],
+      validation_errors: [],
+    });
   }
+
+  // Step 4: Load recent history and build LLM context
+  const recentHistory = await loadRecentHistory(conversation_id);
+
+  const llmContext: LlmContextInput = {
+    current_state: conversationState.fsm_state,
+    detected_events: detectedEvents,
+    cart: conversationState.cart_json,
+    customer_message,
+    recent_history: recentHistory,
+    product_catalog: products,
+  };
+
+  // Step 5: Run LLM orchestrator
+  const llmResponse = await runLlmOrchestrator(llmContext);
+
+  // Step 6: Validate proposed actions
+  const { valid: validActions, rejected } = getValidActions(
+    llmResponse.proposed_actions,
+    {
+      currentState: conversationState.fsm_state,
+      cart: conversationState.cart_json,
+    }
+  );
+
+  // Collect validation errors
+  const validationErrors = rejected.map((r) => r.error).filter((e): e is string => !!e);
+
+  // Step 7: Execute valid actions
+  const executionResult = await executeActions({
+    actions: validActions,
+    current_state: conversationState,
+    product_catalog: products,
+  });
+
+  // Determine final state (prefer action execution result, fall back to LLM suggestion)
+  const finalState = executionResult.new_state.fsm_state;
+
+  // Step 8: Build and return response
+  return buildResponse({
+    human_override: executionResult.new_state.human_override,
+    response_text: llmResponse.response_text,
+    new_state: finalState,
+    executed_actions: executionResult.executed_actions,
+    validation_errors,
+  });
 }
 
 /**
- * Checks if Agent V2 is enabled via feature flag
- * TODO: Implement actual env var check
+ * Checks if Agent V2 is enabled via feature flag.
  */
 export function isAgentV2Enabled(): boolean {
-  // TODO: Read from process.env.AGENT_V2_ENABLED
-  return false;
+  return process.env.AGENT_V2_ENABLED === 'true';
 }
