@@ -61,6 +61,93 @@ const WhatsAppWebhookSchema = z.object({
 // Database Persistence
 // ============================================================================
 
+/**
+ * Resolves contact_id for a given phone number.
+ * Creates contact if it doesn't exist.
+ */
+async function resolveContactId(phone: string, name: string | null, log: any): Promise<string | null> {
+  try {
+    // Try to find existing contact
+    const { data: existing } = await supabaseAdmin
+      .from('contacts')
+      .select('id')
+      .eq('tenant_id', config.TENANT_ID)
+      .eq('wa_phone', phone)
+      .single();
+
+    if (existing) {
+      return existing.id;
+    }
+
+    // Create new contact
+    const { data: created, error } = await supabaseAdmin
+      .from('contacts')
+      .insert({
+        tenant_id: config.TENANT_ID,
+        wa_phone: phone,
+        name: name || null,
+      })
+      .select('id')
+      .single();
+
+    if (error) {
+      log.error({ error: error.message }, '[DB] Failed to create contact');
+      return null;
+    }
+
+    return created.id;
+  } catch (err) {
+    log.error({ error: err }, '[DB] Exception resolving contact');
+    return null;
+  }
+}
+
+/**
+ * Resolves conversation_id for a given contact.
+ * Finds open conversation from last 24h or creates new one.
+ */
+async function resolveConversationId(contactId: string, log: any): Promise<string | null> {
+  try {
+    const twentyFourHoursAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+    // Try to find open conversation from last 24h
+    const { data: existing } = await supabaseAdmin
+      .from('conversations')
+      .select('id')
+      .eq('contact_id', contactId)
+      .eq('tenant_id', config.TENANT_ID)
+      .gte('last_message_at', twentyFourHoursAgo)
+      .order('last_message_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (existing) {
+      return existing.id;
+    }
+
+    // Create new conversation
+    const { data: created, error } = await supabaseAdmin
+      .from('conversations')
+      .insert({
+        contact_id: contactId,
+        tenant_id: config.TENANT_ID,
+        last_message_at: new Date().toISOString(),
+      })
+      .select('id')
+      .single();
+
+    if (error) {
+      log.error({ error: error.message }, '[DB] Failed to create conversation');
+      return null;
+    }
+
+    return created.id;
+  } catch (err) {
+    log.error({ error: err }, '[DB] Exception resolving conversation');
+    return null;
+  }
+}
+
 interface PersistMessageParams {
   direction: 'inbound' | 'outbound';
   phone: string;
@@ -69,10 +156,11 @@ interface PersistMessageParams {
   raw?: unknown;
   waMessageId?: string;
   requestId: string;
+  conversationId?: string | null;
 }
 
 async function persistMessage(params: PersistMessageParams, log: any): Promise<string | null> {
-  const { direction, phone, name, text, raw, waMessageId, requestId } = params;
+  const { direction, phone, name, text, raw, waMessageId, requestId, conversationId } = params;
 
   try {
     const { data, error } = await supabaseAdmin
@@ -85,6 +173,7 @@ async function persistMessage(params: PersistMessageParams, log: any): Promise<s
         raw_payload: raw ? JSON.stringify(raw) : null,
         wa_message_id: waMessageId || null,
         tenant_id: config.TENANT_ID,
+        conversation_id: conversationId || null,
       })
       .select('id')
       .single();
@@ -94,7 +183,15 @@ async function persistMessage(params: PersistMessageParams, log: any): Promise<s
       return null;
     }
 
-    log.info({ messageDbId: data.id, direction, phone: phone.slice(-4), requestId }, '[DB] Message persisted');
+    // Update conversation last_message_at
+    if (conversationId) {
+      await supabaseAdmin
+        .from('conversations')
+        .update({ last_message_at: new Date().toISOString() })
+        .eq('id', conversationId);
+    }
+
+    log.info({ messageDbId: data.id, direction, phone: phone.slice(-4), conversationId, requestId }, '[DB] Message persisted');
     return data.id;
   } catch (err) {
     log.error({ error: err, requestId }, '[DB] Exception persisting message');
@@ -258,6 +355,10 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
             '[WEBHOOK] Inbound message received'
           );
 
+          // Resolve contact and conversation
+          const contactId = await resolveContactId(phone, contactName, request.log);
+          const conversationId = contactId ? await resolveConversationId(contactId, request.log) : null;
+
           // Persist inbound message
           persistMessage({
             direction: 'inbound',
@@ -267,6 +368,7 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
             raw: request.body,
             waMessageId,
             requestId,
+            conversationId,
           }, request.log).catch(err =>
             request.log.error({ error: err, requestId }, '[DB] Failed to persist inbound')
           );
