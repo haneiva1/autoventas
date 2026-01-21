@@ -4,7 +4,7 @@
  * All constants including FSM states, actions, and validation matrix
  */
 
-import type { FsmState, ActionType, ActionValidationRule } from './types';
+import type { FsmState, ActionType, ActionValidationRule, Cart } from './types';
 
 // =============================================================================
 // FSM States
@@ -134,11 +134,11 @@ export const AGENT_V2_FEATURE_FLAG = 'AGENT_V2_ENABLED';
 // Default Cart
 // =============================================================================
 
-export const DEFAULT_CART = {
+export const DEFAULT_CART: Cart = {
   items: [],
   total: 0,
   currency: 'BOB',
-} as const;
+};
 
 // =============================================================================
 // Default Conversation State

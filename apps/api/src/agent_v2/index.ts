@@ -225,7 +225,7 @@ export async function processMessage(
     response_text: llmResponse.response_text,
     new_state: finalState,
     executed_actions: executionResult.executed_actions,
-    validation_errors,
+    validation_errors: validationErrors,
   });
 }
 
