@@ -8,6 +8,7 @@ import { webhookRoutes } from './routes/webhooks.js';
 import { paymentsRoutes } from './routes/payments.js';
 import { ordersRoutes } from './routes/orders.js';
 import { debugRoutes } from './routes/debug.js';
+import { whatsappV2Routes } from './routes/whatsapp-v2';
 
 async function buildApp() {
   const app = Fastify({

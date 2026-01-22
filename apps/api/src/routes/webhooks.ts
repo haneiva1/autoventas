@@ -1,9 +1,10 @@
+import { buildCommercialContext } from "../services/commercial-context.js";
 import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { config } from '../lib/config.js';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { generateReply } from '../services/llm.js';
+import { generateLLMReply } from '../services/llm.js';
 import { processWithRules, getContext } from '../helpers/index.js';
 
 // ============================================================================
@@ -183,16 +184,22 @@ async function processMessage(
   }
 
   // ========================================
-  // PASO 2: Fallback al LLM
-  // ========================================
-  log.info(
-    { phone: phone.slice(-4), requestId },
-    '[PROCESS] Rules did not handle, using LLM'
-  );
+// ===============================
+// ===============================
+// PASO 2: Fallback al LLM
+// ===============================
 
-  const reply = await generateReply(messageText);
+log.info({ phone: phone.slice(-4), requestId }, "[PROCESS] Rules did not handle, using LLM");
 
-  await sendWhatsAppMessage(phone, reply);
+
+
+const commercialContext = await buildCommercialContext();
+
+const fullMessage = `${commercialContext}\nMensaje del cliente:\n${messageText}`;
+
+const reply = await generateLLMReply(fullMessage);
+
+await sendWhatsAppMessage(phone, reply);
 }
 
 // ============================================================================
