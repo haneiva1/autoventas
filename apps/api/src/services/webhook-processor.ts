@@ -4,6 +4,8 @@ import { WhatsAppWebhook, WhatsAppMessage, WhatsAppContact } from '../schemas/wh
 import { generateAIReply } from './ai-agent.js';
 import { detectPaymentProof, createPaymentReview } from './payment-detector.js';
 import { storeOutboundMessage } from './message-store.js';
+import { handlePaymentConfirmation } from './orders/handlePaymentConfirmation.js';
+import { getContext } from '../helpers/conversation-context.js';
 import type { AppLogger } from '../lib/types.js';
 
 export async function processWebhookEvent(
@@ -132,6 +134,37 @@ export async function processMessage(
     { messageId: storedMessage.id, type: message.type },
     'Message stored successfully'
   );
+
+  // Check for payment confirmation intent when in awaiting_payment state
+  const conversationContext = getContext(waPhone);
+  const paymentConfirmationPattern = /ya pague|comprobante|transferi|pague|envie|mande/i;
+  const isPaymentConfirmationIntent = messageBody && paymentConfirmationPattern.test(messageBody);
+
+  if (isPaymentConfirmationIntent && conversationContext.state === 'awaiting_payment') {
+    log.info({ phone: waPhone }, 'Payment confirmation detected in awaiting_payment state');
+
+    const paymentConfirmResult = await handlePaymentConfirmation({
+      phone: waPhone,
+      customerName: contactName,
+      productsJson: conversationContext.flavor ? { flavor: conversationContext.flavor, quantity: conversationContext.quantity } : null,
+      totalAmount: conversationContext.total,
+      currency: 'BOB',
+    });
+
+    if (paymentConfirmResult.ok) {
+      log.info(
+        { orderId: paymentConfirmResult.orderId, paymentId: paymentConfirmResult.paymentId },
+        'Order and payment created from payment confirmation'
+      );
+      return {
+        conversationId: conversation.id,
+        orderId: paymentConfirmResult.orderId,
+        paymentId: paymentConfirmResult.paymentId,
+      };
+    } else {
+      log.error({ error: paymentConfirmResult.error }, 'Failed to create order from payment confirmation');
+    }
+  }
 
   // Update conversation last_message_at
   await supabaseAdmin
