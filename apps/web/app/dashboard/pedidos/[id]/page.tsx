@@ -1,6 +1,7 @@
 import { createClient } from '@/lib/supabase/server';
 import { notFound } from 'next/navigation';
 import { OrderPaymentActions } from './OrderPaymentActions';
+import { isOrderConfirmed, isOrderRejected, isOrderPendingPayment } from '@/lib/order-utils';
 
 interface OrderDetail {
   id: string;
@@ -48,6 +49,8 @@ export default async function OrderDetailPage({
   }
 
   const orderData = order as OrderDetail;
+
+const products = Array.isArray(orderData.products_json) ? orderData.products_json.filter(p => p && typeof p.quantity === "number" && typeof p.price === "number") : [];
 
   // Fetch the most relevant payment for this order:
   // 1. Prefer pending payment (vendor_decision IS NULL) - actionable
@@ -117,36 +120,18 @@ export default async function OrderDetailPage({
     return 'bg-yellow-100 text-yellow-800';
   };
 
-  // Derive header status based on order and payment state
+  // Derive header status based on order status (single source of truth)
   const getDerivedStatus = (): { label: string; badge: string } => {
-    // 1. If order is CONFIRMED, show Confirmado
-    if (orderData.status === 'CONFIRMED') {
+    if (isOrderConfirmed(orderData.status)) {
       return { label: 'Confirmado', badge: 'bg-green-100 text-green-800' };
     }
-
-    // 2. If there's a pending payment (vendor_decision IS NULL, status in pending/pending_review)
-    if (
-      paymentData &&
-      paymentData.vendor_decision === null &&
-      ['pending', 'pending_review'].includes(paymentData.status)
-    ) {
+    if (isOrderRejected(orderData.status)) {
+      return { label: 'Pago rechazado', badge: 'bg-red-100 text-red-800' };
+    }
+    if (isOrderPendingPayment(orderData.status)) {
       return { label: 'Pago pendiente', badge: 'bg-yellow-100 text-yellow-800' };
     }
-
-    // 3. If there's a rejected payment
-    if (
-      paymentData &&
-      (paymentData.status === 'rejected' || paymentData.vendor_decision === 'rejected')
-    ) {
-      return { label: 'Pago rechazado', badge: 'bg-red-100 text-red-800' };
-    }
-
-    // 4. If order is PAYMENT_REJECTED
-    if (orderData.status === 'PAYMENT_REJECTED') {
-      return { label: 'Pago rechazado', badge: 'bg-red-100 text-red-800' };
-    }
-
-    // 5. Fallback to order status
+    // Fallback (should not reach here given isOrderPendingPayment logic)
     return { label: getStatusLabel(orderData.status), badge: getStatusBadge(orderData.status) };
   };
 
@@ -205,9 +190,9 @@ export default async function OrderDetailPage({
         {/* Products */}
         <div className="px-6 py-4 border-b">
           <h3 className="text-sm font-medium text-gray-500 mb-2">Productos</h3>
-          {orderData.products_json && orderData.products_json.length > 0 ? (
+          {products && products.length > 0 ? (
             <ul className="space-y-2">
-              {orderData.products_json.map((item, index) => (
+              {products.map((item, index) => (
                 <li key={index} className="flex justify-between text-sm">
                   <span>
                     {item.quantity}x {item.name}
@@ -264,9 +249,9 @@ export default async function OrderDetailPage({
         </div>
 
         {/* Actions */}
-        {paymentData && paymentData.vendor_decision === null && (
+        {isOrderPendingPayment(orderData.status) && (
           <div className="px-6 py-4 bg-gray-50">
-            <OrderPaymentActions paymentId={paymentData.id} />
+            <OrderPaymentActions orderId={orderData.id} orderStatus={orderData.status} />
           </div>
         )}
       </div>

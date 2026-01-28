@@ -20,32 +20,13 @@ interface Payment {
 export default async function DashboardPage() {
   const supabase = await createClient();
 
-  const { data: payments, error } = await supabase
-    .from('payments')
-    .select(`
-      id,
-      reported_at,
-      proof_message_text,
-      proof_media_id,
-      order_id,
-      orders!inner (
-        id,
-        customer_name,
-        customer_phone,
-        total_amount,
-        currency,
-        products_json
-      )
-    `)
-    .is('vendor_decision', null)
-    .in('status', ['pending', 'pending_review'])
-    .order('reported_at', { ascending: false });
+  const { data: orders, error } = await supabase
+    .from('orders')
+    .select('*')
+    
+    .order('created_at', { ascending: false });
 
-  if (error) {
-    console.error('Error fetching payments:', error);
-  }
-
-  const pendingPayments = (payments || []) as unknown as Payment[];
+  const pendingOrders = orders ?? [];
 
   return (
     <div>
@@ -56,7 +37,7 @@ export default async function DashboardPage() {
         </p>
       </div>
 
-      {pendingPayments.length === 0 ? (
+      {pendingOrders.length === 0 ? (
         <div className="bg-white rounded-lg shadow p-6 text-center">
           <p className="text-gray-500">No hay pagos pendientes de revisar</p>
         </div>
@@ -83,36 +64,34 @@ export default async function DashboardPage() {
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {pendingPayments.map((payment) => (
-                <tr key={payment.id} className="hover:bg-gray-50">
+              {pendingOrders.map((order) => (
+                <tr key={order.id} className="hover:bg-gray-50">
                   <td className="px-6 py-4 whitespace-nowrap">
                     <div className="text-sm font-medium text-gray-900">
-                      {payment.orders.customer_name || 'Sin nombre'}
+                      {order.customer_name || 'Sin nombre'}
                     </div>
                     <div className="text-sm text-gray-500">
-                      {payment.orders.customer_phone}
+                      {order.customer_phone}
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
                     <div className="text-sm font-medium text-gray-900">
-                      {payment.orders.currency || 'Bs'}{' '}
-                      {payment.orders.total_amount?.toFixed(2) || '0.00'}
+                      {order.currency || 'Bs'}{' '}
+                      {order.total_amount?.toFixed(2) || '0.00'}
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {new Date(payment.reported_at).toLocaleString('es-BO', {
+                    {new Date(order.created_at).toLocaleString('es-BO', {
                       dateStyle: 'short',
                       timeStyle: 'short',
                     })}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">
-                      Pendiente
-                    </span>
+                    {order.status === 'CONFIRMED' ? (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Pagado</span>) : order.status === 'PAYMENT_REJECTED' ? (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">Rechazado</span>) : (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">Pendiente</span>)}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                     <Link
-                      href={`/dashboard/pedidos/${payment.order_id}`}
+                      href={`/dashboard/pedidos/${order.id}`}
                       className="text-blue-600 hover:text-blue-900"
                     >
                       Ver detalle
