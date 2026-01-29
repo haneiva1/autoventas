@@ -17,7 +17,7 @@ export default async function OrdersPage() {
   const { data: orders, error } = await supabase
     .from('orders')
     .select('id, customer_name, customer_phone, total_amount, currency, status, created_at')
-    .eq('status', 'CONFIRMED')
+    .in('status', ['CONFIRMED','PAYMENT_PENDING'])
     .order('created_at', { ascending: false })
     .limit(50);
 
