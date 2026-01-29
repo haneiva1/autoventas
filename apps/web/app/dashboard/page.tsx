@@ -1,29 +1,13 @@
 import { createClient } from '@/lib/supabase/server';
 import Link from 'next/link';
 
-interface Payment {
-  id: string;
-  reported_at: string;
-  proof_message_text: string | null;
-  proof_media_id: string | null;
-  order_id: string;
-  orders: {
-    id: string;
-    customer_name: string | null;
-    customer_phone: string;
-    total_amount: number | null;
-    currency: string | null;
-    products_json: unknown[];
-  };
-}
-
 export default async function DashboardPage() {
   const supabase = await createClient();
 
-  const { data: orders, error } = await supabase
+  const { data: orders } = await supabase
     .from('orders')
     .select('*')
-    
+    .in('status', ['PAYMENT_PENDING', 'PAID'])
     .order('created_at', { ascending: false });
 
   const pendingOrders = orders ?? [];
@@ -87,7 +71,11 @@ export default async function DashboardPage() {
                     })}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap">
-                    {order.status === 'CONFIRMED' ? (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Pagado</span>) : order.status === 'PAYMENT_REJECTED' ? (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">Rechazado</span>) : (<span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">Pendiente</span>)}
+                    {order.status === 'PAID' ? (
+                      <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-green-100 text-green-800">Confirmado</span>
+                    ) : (
+                      <span className="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-yellow-100 text-yellow-800">Pendiente</span>
+                    )}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                     <Link
