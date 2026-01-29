@@ -17,7 +17,7 @@ export default async function OrdersPage() {
   const { data: orders, error } = await supabase
     .from('orders')
     .select('id, customer_name, customer_phone, total_amount, currency, status, created_at')
-    .eq('status', 'CONFIRMED')
+    .eq('status', 'PAID')
     .order('created_at', { ascending: false })
     .limit(50);
 
@@ -31,7 +31,7 @@ export default async function OrdersPage() {
     const badges: Record<string, string> = {
       DRAFT: 'bg-gray-100 text-gray-800',
       PENDING_PAYMENT: 'bg-yellow-100 text-yellow-800',
-      CONFIRMED: 'bg-green-100 text-green-800',
+      PAID: 'bg-green-100 text-green-800',
       DELIVERED: 'bg-blue-100 text-blue-800',
       CANCELLED: 'bg-red-100 text-red-800',
     };
@@ -42,7 +42,7 @@ export default async function OrdersPage() {
     const labels: Record<string, string> = {
       DRAFT: 'Borrador',
       PENDING_PAYMENT: 'Pendiente Pago',
-      CONFIRMED: 'Confirmado',
+      PAID: 'Pagado',
       DELIVERED: 'Entregado',
       CANCELLED: 'Cancelado',
     };
