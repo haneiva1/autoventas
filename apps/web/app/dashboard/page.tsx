@@ -7,7 +7,7 @@ export default async function DashboardPage() {
   const { data: orders } = await supabase
     .from('orders')
     .select('*')
-    .in('status', ['PAYMENT_PENDING', 'PAID'])
+    .eq('status', 'PAYMENT_PENDING')
     .order('created_at', { ascending: false });
 
   const pendingOrders = orders ?? [];
