@@ -1,11 +1,13 @@
-import { buildCommercialContext } from "../services/commercial-context.js";
 import { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { config } from '../lib/config.js';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { generateLLMReply } from '../services/llm.js';
+import { generateReply } from '../services/llm.js';
 import { processWithRules, getContext } from '../helpers/index.js';
+import { detectPaymentProof } from "../services/payment-detector.js";
+import { createPendingOrder } from "../bridges/order-bridge.js";
+import { createPaymentReview } from "../services/payment-review.js";
 
 // ============================================================================
 // WhatsApp Webhook Schema
@@ -94,8 +96,7 @@ async function persistMessage(params: PersistMessageParams, log: any): Promise<s
       log.error({ error: error.message, code: error.code, requestId }, '[DB] Failed to persist message');
       return null;
     }
-
-    log.info({ messageDbId: data.id, direction, phone: phone.slice(-4), requestId }, '[DB] Message persisted');
+log.info({ messageDbId: data.id, direction, phone: phone.slice(-4), requestId }, '[DB] Message persisted');
     return data.id;
   } catch (err) {
     log.error({ error: err, requestId }, '[DB] Exception persisting message');
@@ -143,6 +144,11 @@ async function sendWhatsAppMessage(to: string, text: string): Promise<void> {
 // Message Processing with Rules + LLM Fallback
 // ============================================================================
 
+// ==============================
+// AGENT BRAIN (deterministic)
+// ==============================
+import { decideCommerce, executeDecision } from "../agent/index.js";
+
 async function processMessage(
   phone: string,
   messageText: string,
@@ -150,7 +156,24 @@ async function processMessage(
   log: any,
   requestId: string
 ): Promise<void> {
-  // Log context state before processing
+  
+  // === CONTRACT GOVERNS (antes del LLM) ===
+  try {
+    const decision = await decideCommerce({ messageText });
+    if (decision.type !== "NO_OP") {
+      await executeDecision(decision, {
+        sendText: async (text: string) => sendWhatsAppMessage(phone, text),
+        sendQr: async (qrUrl: string, text?: string) =>
+          sendWhatsAppMessage(phone, `${(text ?? "").trim()}\n\n${qrUrl}`.trim()),
+      });
+      return; // 🔒 contrato gobierna: corta flujo
+    }
+  } catch (e) {
+    console.warn({ err: e }, "[CONTRACT] failed");
+  }
+  // === END CONTRACT ===
+
+// Log context state before processing
   const contextBefore = getContext(phone);
   log.info(
     {
@@ -162,6 +185,56 @@ async function processMessage(
     },
     '[PROCESS] Processing message'
   );
+
+  // =====================================================
+  // BRIDGE: Payment proof (deterministic, no LLM)
+  // =====================================================
+  try {
+    log.info("[BRIDGE] entered");
+
+    const isPaymentProof = detectPaymentProof(
+      { text: { body: messageText } } as any,
+      messageText
+    );
+
+    if (isPaymentProof) {
+      log.info("[BRIDGE] payment proof detected");
+
+      
+const orderResult = await createPendingOrder({
+  phone,
+  customer_name: contactName ?? null,
+  products: [],
+  total_amount: 0,
+  currency: 'BOB',
+  source: 'whatsapp',
+  conversation_snapshot: {
+    state: 'awaiting_payment',
+    confirmed_at: new Date().toISOString(),
+  },
+});
+
+
+      
+await createPaymentReview({
+  order: orderResult,
+  message: { from: phone, text: { body: messageText } },
+} as any);
+
+
+      log.info("[BRIDGE] order + payment_review created");
+
+      await sendWhatsAppMessage(
+        phone,
+        "Gracias, recibimos tu pago. Estamos verificándolo y te confirmaremos en breve."
+      );
+
+      return; // ⛔ corta flujo: NO rules, NO LLM
+    }
+  } catch (err) {
+    log.error({ err }, "[BRIDGE] error processing payment proof");
+  }
+
 
   // ========================================
   // PASO 1: Intentar manejar con reglas
@@ -184,22 +257,19 @@ async function processMessage(
   }
 
   // ========================================
-// ===============================
-// ===============================
-// PASO 2: Fallback al LLM
-// ===============================
+  // PASO 2: Fallback al LLM
+  // ========================================
+  log.info(
+    { phone: phone.slice(-4), requestId },
+    '[PROCESS] Rules did not handle, using LLM'
+  );
 
-log.info({ phone: phone.slice(-4), requestId }, "[PROCESS] Rules did not handle, using LLM");
+  
+    
 
+    const reply = await generateReply(messageText);
 
-
-const commercialContext = await buildCommercialContext();
-
-const fullMessage = `${commercialContext}\nMensaje del cliente:\n${messageText}`;
-
-const reply = await generateLLMReply(fullMessage);
-
-await sendWhatsAppMessage(phone, reply);
+  await sendWhatsAppMessage(phone, reply);
 }
 
 // ============================================================================
@@ -231,7 +301,7 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
 
     const parseResult = WhatsAppWebhookSchema.safeParse(request.body);
     if (!parseResult.success) {
-      request.log.warn({ errors: parseResult.error.issues, requestId }, '[WEBHOOK] Invalid payload');
+      console.warn({ errors: parseResult.error.issues, requestId }, '[WEBHOOK] Invalid payload');
       return reply.status(400).send({ error: 'Invalid payload' });
     }
 
@@ -257,10 +327,28 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
 
           const phone = message.from;
           const text = message.text.body;
+const messageText = text;
+
+  try {
+    const { runContractDebug } = await import("../agent/contract/contract-executor.js");
+    runContractDebug({
+      messageText,
+      state: {
+        step: "START",
+        hasSeenCatalog: false,
+        cart: [],
+        deliveryMethod: null,
+        totalAmount: 0,
+      },
+    });
+  } catch (e) {
+    console.error("[CONTRACT] debug failed", e);
+  }
+
           const waMessageId = message.id;
           const contactName = value.contacts?.[0]?.profile?.name || null;
 
-          request.log.info(
+          console.log(
             { requestId, wa_id: phone.slice(-4), textPreview: text.slice(0, 50), waMessageId },
             '[WEBHOOK] Inbound message received'
           );
@@ -291,7 +379,7 @@ export const webhookRoutes: FastifyPluginAsync = async (fastify) => {
     }
 
     const duration = Date.now() - startTime;
-    request.log.info({ duration, requestId }, '[WEBHOOK] Response sent');
+    console.log({ duration, requestId }, '[WEBHOOK] Response sent');
 
     return reply.status(200).send({ received: true });
   });
