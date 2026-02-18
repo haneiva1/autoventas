@@ -3,11 +3,9 @@ import { z } from 'zod';
 import { randomUUID } from 'crypto';
 import { config } from '../lib/config.js';
 import { supabaseAdmin } from '../lib/supabase.js';
-import { generateReply } from '../services/llm.js';
+import { generateLLMReply } from '../services/llm.js';
 import { processWithRules, getContext } from '../helpers/index.js';
 import { detectPaymentProof } from "../services/payment-detector.js";
-import { createPendingOrder } from "../bridges/order-bridge.js";
-import { createPaymentReview } from "../services/payment-review.js";
 
 // ============================================================================
 // WhatsApp Webhook Schema
@@ -189,57 +187,57 @@ async function processMessage(
   // =====================================================
   // BRIDGE: Payment proof (deterministic, no LLM)
   // =====================================================
-  try {
-    log.info("[BRIDGE] entered");
-
-    const isPaymentProof = detectPaymentProof(
-      { text: { body: messageText } } as any,
-      messageText
-    );
-
-    if (isPaymentProof) {
-      log.info("[BRIDGE] payment proof detected");
-
-      
-const orderResult = await createPendingOrder({
-  phone,
-  customer_name: contactName ?? null,
-  products: [],
-  total_amount: 0,
-  currency: 'BOB',
-  source: 'whatsapp',
-  conversation_snapshot: {
-    state: 'awaiting_payment',
-    confirmed_at: new Date().toISOString(),
-  },
-});
-
-
-      
-await createPaymentReview({
-  order: orderResult,
-  message: { from: phone, text: { body: messageText } },
-} as any);
-
-
-      log.info("[BRIDGE] order + payment_review created");
-
-      await sendWhatsAppMessage(
-        phone,
-        "Gracias, recibimos tu pago. Estamos verificándolo y te confirmaremos en breve."
-      );
-
-      return; // ⛔ corta flujo: NO rules, NO LLM
-    }
-  } catch (err) {
-    log.error({ err }, "[BRIDGE] error processing payment proof");
-  }
-
-
-  // ========================================
-  // PASO 1: Intentar manejar con reglas
-  // ========================================
-  const ruleResult = processWithRules(phone, messageText, contactName);
+//  try {
+//    log.info("[BRIDGE] entered");
+//
+//    const isPaymentProof = detectPaymentProof(
+//      { text: { body: messageText } } as any,
+//      messageText
+//    );
+//
+//    if (isPaymentProof) {
+//      log.info("[BRIDGE] payment proof detected");
+//// 
+////       
+//// const orderResult = await createPendingOrder({
+////   phone,
+////   customer_name: contactName ?? null,
+////   products: [],
+////   total_amount: 0,
+////   currency: 'BOB',
+////   source: 'whatsapp',
+////   conversation_snapshot: {
+////     state: 'awaiting_payment',
+////     confirmed_at: new Date().toISOString(),
+////   },
+//// });
+//// 
+//// 
+////       
+//// await createPaymentReview({
+////   order: orderResult,
+////   message: { from: phone, text: { body: messageText } },
+//// } as any);
+//// 
+//// 
+////       log.info("[BRIDGE] order + payment_review created");
+//// 
+////       await sendWhatsAppMessage(
+////         phone,
+////         "Gracias, recibimos tu pago. Estamos verificándolo y te confirmaremos en breve."
+////       );
+//// 
+////       return; // ⛔ corta flujo: NO rules, NO LLM
+////     }
+////   } catch (err) {
+//     log.error({ err }, "[BRIDGE] error processing payment proof");
+//   }
+// 
+// 
+//   // ========================================
+//   // PASO 1: Intentar manejar con reglas
+//   // ========================================
+const ruleResult = processWithRules(phone, messageText, contactName);
 
   if (ruleResult.handled && ruleResult.reply) {
     log.info(
@@ -267,7 +265,7 @@ await createPaymentReview({
   
     
 
-    const reply = await generateReply(messageText);
+    const reply = await generateLLMReply(messageText);
 
   await sendWhatsAppMessage(phone, reply);
 }

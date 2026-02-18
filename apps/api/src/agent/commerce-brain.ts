@@ -40,5 +40,5 @@ export function commerceBrain(input: { text: string }): CommerceDecision {
   }
 
   // 3) Fallback duro (contrato)
-  return { type: "SEND_TEXT", text: "🧪 CONTRATO ACTIVO – cerebro determinista en control" };
+  return { type: "NO_OP" };
 }
