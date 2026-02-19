@@ -1,12 +1,24 @@
 import { supabaseAdmin } from '../lib/supabase.js';
 import { config } from '../lib/config.js';
 import { WhatsAppWebhook, WhatsAppMessage, WhatsAppContact } from '../schemas/whatsapp.js';
-import { generateAIReply } from './ai-agent.js';
-import { detectPaymentProof, createPaymentReview } from './payment-detector.js';
 import { storeOutboundMessage } from './message-store.js';
-import { handlePaymentConfirmation } from './orders/handlePaymentConfirmation.js';
-import { getContext } from '../helpers/conversation-context.js';
 import type { AppLogger } from '../lib/types.js';
+
+// Catálogo hardcodeado
+const CATALOG: Record<string, { name: string; price: number }> = {
+  '1': { name: 'Chocolate Clásico', price: 30 },
+  '2': { name: 'Chocolate Premium', price: 45 },
+};
+
+// State types
+type ConversationState = 'IDLE' | 'BUILDING_ORDER' | 'AWAITING_PAYMENT';
+
+interface CartItem {
+  productId: string;
+  name: string;
+  quantity: number;
+  price: number;
+}
 
 export async function processWebhookEvent(
   payload: WhatsAppWebhook,
@@ -70,7 +82,7 @@ export async function processMessage(
   const waPhone = message.from;
   const contactName = contact?.profile?.name || null;
 
-  // Find or create contact
+  // 1. Upsert contact
   const { data: dbContact, error: contactError } = await supabaseAdmin
     .from('contacts')
     .upsert(
@@ -94,7 +106,7 @@ export async function processMessage(
     return { conversationId: null, orderId: null, paymentId: null };
   }
 
-  // Find or create conversation
+  // 2. Find or create conversation
   let conversation = await findActiveConversation(dbContact.id, log);
   if (!conversation) {
     conversation = await createConversation(dbContact.id, log);
@@ -105,11 +117,9 @@ export async function processMessage(
     return { conversationId: null, orderId: null, paymentId: null };
   }
 
-  // Extract message body
+  // 3. Extract and store inbound message
   const messageBody = extractMessageBody(message);
 
-  // Store normalized message
-  log.info({ tenant_id: config.TENANT_ID, conversation_id: conversation.id, direction: 'in', message_type: message.type, body: messageBody }, '[DEBUG] About to insert INBOUND message into messages table');
   const { data: storedMessage, error: messageError } = await supabaseAdmin
     .from('messages')
     .insert({
@@ -124,107 +134,168 @@ export async function processMessage(
     .select()
     .single();
 
-  log.info({ storedMessage, messageError }, '[DEBUG] INBOUND message insert result');
   if (messageError) {
     log.error({ error: messageError }, 'Failed to store message');
     return { conversationId: conversation.id, orderId: null, paymentId: null };
   }
 
-  log.info(
-    { messageId: storedMessage.id, type: message.type },
-    'Message stored successfully'
-  );
+  log.info({ messageId: storedMessage.id, type: message.type }, 'Message stored');
 
-  // Check for payment confirmation intent when in awaiting_payment state
-  const conversationContext = getContext(waPhone);
-  const paymentConfirmationPattern = /ya pague|comprobante|transferi|pague|envie|mande/i;
-  const isPaymentConfirmationIntent = messageBody && paymentConfirmationPattern.test(messageBody);
-
-  if (isPaymentConfirmationIntent && conversationContext.state === 'awaiting_payment') {
-    log.info({ phone: waPhone }, 'Payment confirmation detected in awaiting_payment state');
-
-    const paymentConfirmResult = await handlePaymentConfirmation({
-      phone: waPhone,
-      customerName: contactName,
-      productsJson: conversationContext.flavor ? { flavor: conversationContext.flavor, quantity: conversationContext.quantity } : null,
-      totalAmount: conversationContext.total,
-      currency: 'BOB',
-    });
-
-    if (paymentConfirmResult.ok) {
-      log.info(
-        { orderId: paymentConfirmResult.orderId, paymentId: paymentConfirmResult.paymentId },
-        'Order and payment created from payment confirmation'
-      );
-      return {
-        conversationId: conversation.id,
-        orderId: paymentConfirmResult.orderId,
-        paymentId: paymentConfirmResult.paymentId,
-      };
-    } else {
-      log.error({ error: paymentConfirmResult.error }, 'Failed to create order from payment confirmation');
-    }
-  }
-
-  // Update conversation last_message_at
+  // 4. Update last_message_at
   await supabaseAdmin
     .from('conversations')
     .update({ last_message_at: new Date().toISOString() })
     .eq('id', conversation.id);
 
-  // Check for payment proof
-  const isPaymentProof = detectPaymentProof(message, messageBody);
+  // 5. Get or create conversation state
+  const { data: stateRow } = await supabaseAdmin
+    .from('conversation_state')
+    .select('*')
+    .eq('tenant_id', config.TENANT_ID)
+    .eq('conversation_id', conversation.id)
+    .single();
 
-  if (isPaymentProof) {
-    log.info('Payment proof detected');
-    const paymentResult = await createPaymentReview({
-      conversationId: conversation.id,
-      contactId: dbContact.id,
-      customerPhone: waPhone,
-      customerName: contactName,
-      messageText: messageBody,
-      mediaId: message.image?.id || null,
-      log,
-    });
-    return {
-      conversationId: conversation.id,
-      orderId: paymentResult?.orderId || null,
-      paymentId: paymentResult?.paymentId || null,
-    }; // Don't generate AI reply for payment proofs
+  let currentState: ConversationState = (stateRow?.state as ConversationState) || 'IDLE';
+  let cart: CartItem[] = stateRow?.cart_json || [];
+  let total: number = stateRow?.total || 0;
+
+  const text = (messageBody || '').trim().toLowerCase();
+  let reply = '';
+  let orderId: string | null = null;
+
+  // 6. State machine logic
+
+  // SALUDO - resets to BUILDING_ORDER
+  if (/hola|buenas|buenos/.test(text)) {
+    currentState = 'BUILDING_ORDER';
+    cart = [];
+    total = 0;
+    reply = `¡Hola! 🍫 Bienvenido a Chocolates Ruah.
+
+Nuestro catálogo:
+1. Chocolate Clásico - Bs 30
+2. Chocolate Premium - Bs 45
+
+Escribe "1 x2" para pedir 2 Clásicos.
+Cuando termines, escribe PAGAR.`;
   }
+  // BUILDING_ORDER - add items or PAGAR
+  else if (currentState === 'BUILDING_ORDER') {
+    const addMatch = text.match(/^(\d)\s*x\s*(\d+)$/i);
 
-  // Generate AI reply
-  try {
-    const conversationHistory = await getConversationHistory(conversation.id);
-    const products = await getProductCatalog();
+    if (addMatch) {
+      const productId = addMatch[1];
+      const quantity = parseInt(addMatch[2], 10);
+      const product = CATALOG[productId];
 
-    const aiReply = await generateAIReply({
-      customerName: contactName,
-      messageBody,
-      conversationHistory,
-      products,
-      log,
-    });
+      if (product && quantity > 0) {
+        // Add to cart or update quantity
+        const existingIndex = cart.findIndex((item) => item.productId === productId);
+        if (existingIndex >= 0) {
+          cart[existingIndex].quantity += quantity;
+        } else {
+          cart.push({
+            productId,
+            name: product.name,
+            quantity,
+            price: product.price,
+          });
+        }
 
-    if (aiReply) {
-      await storeOutboundMessage({
-        conversationId: conversation.id,
-        body: aiReply,
-        log,
-      });
-      log.info('AI reply stored');
+        // Recalculate total
+        total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+
+        const cartSummary = cart.map((item) => `${item.name} x${item.quantity}`).join('\n');
+        reply = `✅ Agregado.
+
+Tu carrito:
+${cartSummary}
+
+Total: Bs ${total}
+
+Agrega más o escribe PAGAR para finalizar.`;
+      } else {
+        reply = 'Producto no válido. Usa 1 o 2.';
+      }
     }
-  } catch (error) {
-    log.error({ error }, 'Failed to generate AI reply');
-    // Store fallback message
-    await storeOutboundMessage({
-      conversationId: conversation.id,
-      body: 'Estoy teniendo problemas, un humano te escribirá.',
-      log,
-    });
+    // PAGAR command
+    else if (text === 'pagar') {
+      if (cart.length === 0) {
+        reply = 'Tu carrito está vacío. Agrega productos primero.';
+      } else {
+        currentState = 'AWAITING_PAYMENT';
+        reply = `Total a pagar: Bs ${total}
+
+Escanea el QR para pagar:
+https://api.chocolatesruah.com/pay/qr
+
+Cuando termines, escribe "ya pagué".`;
+      }
+    } else {
+      reply = 'No entendí. Escribe "1 x2" para agregar o PAGAR para finalizar.';
+    }
+  }
+  // AWAITING_PAYMENT - check for payment confirmation
+  else if (currentState === 'AWAITING_PAYMENT') {
+    if (/ya pague|ya pagué|pague/.test(text)) {
+      // Create order
+      const { data: orderData, error: orderError } = await supabaseAdmin
+        .from('orders')
+        .insert({
+          tenant_id: config.TENANT_ID,
+          customer_phone: waPhone,
+          customer_name: contactName,
+          status: 'PAYMENT_PENDING',
+          products_json: cart,
+          total_amount: total,
+          currency: 'BOB',
+          delivery_method: 'PICKUP',
+          source: 'whatsapp',
+        })
+        .select('id')
+        .single();
+
+      if (orderError) {
+        log.error({ error: orderError }, 'Failed to create order');
+        reply = 'Hubo un error al crear tu pedido. Intenta de nuevo.';
+      } else {
+        orderId = orderData.id;
+        currentState = 'IDLE';
+        cart = [];
+        total = 0;
+        reply = 'Gracias 🙌 Estamos verificando tu pago.';
+        log.info({ orderId }, 'Order created with PAYMENT_PENDING');
+      }
+    } else {
+      reply = 'Estamos esperando tu pago. Escribe "ya pagué" cuando termines.';
+    }
+  }
+  // IDLE or default
+  else {
+    reply = 'No entendí tu mensaje. Escribe "hola" para comenzar.';
   }
 
-  return { conversationId: conversation.id, orderId: null, paymentId: null };
+  // 7. Save state
+  await supabaseAdmin.from('conversation_state').upsert(
+    {
+      tenant_id: config.TENANT_ID,
+      conversation_id: conversation.id,
+      state: currentState,
+      cart_json: cart,
+      total,
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: 'tenant_id,conversation_id' }
+  );
+
+  // 8. Store outbound message
+  await storeOutboundMessage({
+    conversationId: conversation.id,
+    body: reply,
+    log,
+  });
+
+  return { conversationId: conversation.id, orderId, paymentId: null };
 }
 
 function extractMessageBody(message: WhatsAppMessage): string | null {
@@ -287,27 +358,3 @@ async function createConversation(
   return data;
 }
 
-async function getConversationHistory(
-  conversationId: string
-): Promise<Array<{ direction: string; body: string | null }>> {
-  const { data } = await supabaseAdmin
-    .from('messages')
-    .select('direction, body')
-    .eq('conversation_id', conversationId)
-    .order('created_at', { ascending: false })
-    .limit(20);
-
-  return data || [];
-}
-
-async function getProductCatalog(): Promise<
-  Array<{ name: string; price: number; description: string | null }>
-> {
-  const { data } = await supabaseAdmin
-    .from('vendi_products')
-    .select('name, price, description')
-    .eq('tenant_id', config.TENANT_ID)
-    .eq('is_active', true);
-
-  return data || [];
-}
