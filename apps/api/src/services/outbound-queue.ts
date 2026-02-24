@@ -1,5 +1,6 @@
 import { supabaseAdmin } from '../lib/supabase.js';
 import type { AppLogger } from '../lib/types.js';
+import { sendWhatsAppText } from './whatsapp-sender.js';
 
 export interface EnqueueOutboundMessageParams {
   to_phone: string;
@@ -62,6 +63,18 @@ export async function enqueueOutboundMessage(
   }
 
   log.info({ outbound_id: data.id, to_phone }, 'Outbound message enqueued');
+
+  try {
+  await sendWhatsAppText(to_phone, body);
+
+  await supabaseAdmin
+    .from('outbound_messages')
+    .update({ status: 'sent' })
+    .eq('id', data.id);
+
+} catch (e) {
+  console.error('[WA] Immediate send failed, keeping pending', e);
+}
   return { outbound_id: data.id };
 }
 

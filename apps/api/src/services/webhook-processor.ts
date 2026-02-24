@@ -3,6 +3,7 @@ import { config } from '../lib/config.js';
 import { WhatsAppWebhook, WhatsAppMessage, WhatsAppContact } from '../schemas/whatsapp.js';
 import { storeOutboundMessage } from './message-store.js';
 import type { AppLogger } from '../lib/types.js';
+import { parseProductOrder, addToCart, calcCartTotal } from './product-parser.js';
 
 // Catálogo hardcodeado
 const CATALOG: Record<string, { name: string; price: number }> = {
@@ -149,19 +150,30 @@ export async function processMessage(
 
   // 5. Get or create conversation state
   const { data: stateRow } = await supabaseAdmin
-    .from('conversation_state')
-    .select('*')
-    .eq('tenant_id', config.TENANT_ID)
-    .eq('conversation_id', conversation.id)
-    .single();
+  .from('conversation_state')
+  .select('*')
+  .eq('tenant_id', config.TENANT_ID)
+  .eq('wa_from', waPhone)
+  .single();
 
-  let currentState: ConversationState = (stateRow?.state as ConversationState) || 'IDLE';
-  let cart: CartItem[] = stateRow?.cart_json || [];
-  let total: number = stateRow?.total || 0;
+  let currentState: ConversationState = (stateRow?.current_state as ConversationState) || 'IDLE';
+  let cart: CartItem[] = stateRow?.cart || [];
+  let total: number = stateRow?.total_amount || 0;
 
   const text = (messageBody || '').trim().toLowerCase();
   let reply = '';
   let orderId: string | null = null;
+
+  await supabaseAdmin
+    .from('conversation_state')
+    .upsert({
+      tenant_id: config.TENANT_ID,
+      wa_from: waPhone,
+      current_state: currentState,
+      cart,
+      total_amount: total
+    }, { onConflict: 'tenant_id,wa_from' });
+
 
   // 6. State machine logic
 
@@ -180,62 +192,49 @@ Escribe "1 x2" para pedir 2 Clásicos.
 Cuando termines, escribe PAGAR.`;
   }
   // BUILDING_ORDER - add items or PAGAR
-  else if (currentState === 'BUILDING_ORDER') {
-    const addMatch = text.match(/^(\d)\s*x\s*(\d+)$/i);
+else if (currentState === 'BUILDING_ORDER') {
 
-    if (addMatch) {
-      const productId = addMatch[1];
-      const quantity = parseInt(addMatch[2], 10);
-      const product = CATALOG[productId];
+  const { data: products } = await supabaseAdmin
+    .from('vendi_products')
+    .select('id, name, price, currency')
+    .eq('tenant_id', config.TENANT_ID)
+    .eq('is_active', true);
 
-      if (product && quantity > 0) {
-        // Add to cart or update quantity
-        const existingIndex = cart.findIndex((item) => item.productId === productId);
-        if (existingIndex >= 0) {
-          cart[existingIndex].quantity += quantity;
-        } else {
-          cart.push({
-            productId,
-            name: product.name,
-            quantity,
-            price: product.price,
-          });
-        }
+  const parsed = parseProductOrder(text, products || []);
 
-        // Recalculate total
-        total = cart.reduce((sum, item) => sum + item.price * item.quantity, 0);
+  if (parsed) {
+    cart = addToCart(cart, parsed);
+    total = calcCartTotal(cart);
 
-        const cartSummary = cart.map((item) => `${item.name} x${item.quantity}`).join('\n');
-        reply = `✅ Agregado.
+    const cartSummary = cart.map(i => `${i.name} x${i.quantity}`).join('\n');
+
+    reply = `✅ Agregado.
 
 Tu carrito:
 ${cartSummary}
 
 Total: Bs ${total}
 
-Agrega más o escribe PAGAR para finalizar.`;
-      } else {
-        reply = 'Producto no válido. Usa 1 o 2.';
-      }
-    }
-    // PAGAR command
-    else if (text === 'pagar') {
-      if (cart.length === 0) {
-        reply = 'Tu carrito está vacío. Agrega productos primero.';
-      } else {
-        currentState = 'AWAITING_PAYMENT';
-        reply = `Total a pagar: Bs ${total}
+Escribe PAGAR para continuar o agrega más productos.`;
 
-Escanea el QR para pagar:
+  } else if (text === 'pagar') {
+
+    if (cart.length === 0) {
+      reply = 'Tu carrito está vacío.';
+    } else {
+      currentState = 'AWAITING_PAYMENT';
+      reply = `Total a pagar: Bs ${total}
+
+Escanea el QR:
 https://api.chocolatesruah.com/pay/qr
 
-Cuando termines, escribe "ya pagué".`;
-      }
-    } else {
-      reply = 'No entendí. Escribe "1 x2" para agregar o PAGAR para finalizar.';
+Cuando pagues, escribe: Ya pagué ${total}`;
     }
+
+  } else {
+    reply = 'No entendí el producto. Escribe el nombre del chocolate.';
   }
-  // AWAITING_PAYMENT - check for payment confirmation
+}
   else if (currentState === 'AWAITING_PAYMENT') {
     if (/ya pague|ya pagué|pague/.test(text)) {
       // Create order
@@ -279,13 +278,13 @@ Cuando termines, escribe "ya pagué".`;
   await supabaseAdmin.from('conversation_state').upsert(
     {
       tenant_id: config.TENANT_ID,
-      conversation_id: conversation.id,
-      state: currentState,
-      cart_json: cart,
-      total,
+      wa_from: waPhone,
+      current_state: currentState,
+      cart: cart,
+      total_amount: total,
       updated_at: new Date().toISOString(),
     },
-    { onConflict: 'tenant_id,conversation_id' }
+    { onConflict: 'tenant_id,wa_from' }
   );
 
   // 8. Store outbound message
